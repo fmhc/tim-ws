@@ -1,9 +1,10 @@
 # tim-ws
 
-A small bridge from a **SICK TiM** 2D LiDAR to **WebSocket** clients.
-It connects to the scanner over TCP (CoLa A, port 2111), subscribes to the scan
-stream, and fans every scan out as JSON or a compact binary frame, with UTC
-timestamps and the host's NTP clock status.
+A small bridge from a **SICK TiM** 2D LiDAR to **WebSocket** clients, with no
+ROS required. It connects to the scanner over TCP (CoLa A, port 2111),
+subscribes to the scan stream, and fans every scan out as JSON or a compact
+binary frame, with UTC timestamps and the host's NTP clock status. One binary
+of about 1.6 MB; a browser viewer is included.
 
 - Non-blocking: one async task per connection (tokio, single thread). Every
   message is serialised once and shared by all clients. A slow client
@@ -16,6 +17,9 @@ timestamps and the host's NTP clock status.
 - Time: host receive time in UTC µs, the scanner's free-running µs clock
   mapped to UTC (sliding-minimum offset estimate), and the kernel NTP state
   (`adjtimex`, read-only).
+- SICK status codes are kept apart from distances: "no echo", "dazzled" and
+  "implausible" are reported per point instead of turning into phantom
+  readings of a few millimetres.
 - Raw recording to JSONL with a size limit, and replay paced by the device
   clock, so the whole pipeline runs offline.
 
@@ -24,17 +28,25 @@ from -45° to 225° in 1° steps). Over 30 s it delivered 15.03 Hz with no
 counter gaps and no bad telegrams to a JSON and a binary client at once.
 Receive jitter was 0.22 ms (standard deviation); the UTC-mapped device clock
 reduced that to 0.04 ms. It reconnected 250 ms after the TCP connection was
-killed and confirmed the unsubscribe on shutdown. Other TiM5xx models with
-CoLa A should work, but that is untested.
+killed and confirmed the unsubscribe on shutdown. The same held over Wi-Fi
+through a home router, where receive jitter rose to 6 ms and the mapped clock
+stayed at 0.04 ms. Other TiM5xx models with CoLa A should work, but that is
+untested.
 
 Throughput is not the bottleneck: an unthrottled replay pushed about 25,000
 scans/s to two clients at once, in 3.4 MB of resident memory.
 
+## Install
+
+```sh
+cargo install --git https://github.com/fmhc/tim-ws --tag v0.1.1
+# or from a checkout
+cargo build --release
+```
+
 ## Usage
 
 ```sh
-cargo build --release
-
 # Live: scanner address as configured on the device
 ./target/release/tim-ws --sensor 192.168.0.1:2111
 
@@ -44,6 +56,8 @@ cargo build --release
 # Offline: replay a recording in real time, 4x, or as fast as possible (0)
 ./target/release/tim-ws --replay scans.jsonl --speed 1 --loop
 ```
+
+The commands assume a checkout; after `cargo install` the binary is just `tim-ws`.
 
 By default it listens on `127.0.0.1:9002`. Use `--listen 0.0.0.0:9002` to serve
 the network. Connect to `ws://host:9002/` for JSON, or `ws://host:9002/?format=binary`
@@ -101,20 +115,21 @@ old data look fresh.
   "counter_gap": 0, "device_clock_restarted": false, "scan_hz": 15.0,
   "angle": { "unit": "deg", "convention": "sick_device", "start": -45.0, "step": 1.0, "count": 271 },
   "range_m": [0.176, 0.169, null, 1.014, "…"],
+  "invalid": { "no_echo": 7, "dazzled": 0, "implausible": 1, "reserved": 0, "below_threshold": 0 },
+  "codes": [[102, 2]],
   "device": { "serial": "…", "status": [0, 0], "telegram_counter": 8708, "scan_counter": 8710,
               "time_since_startup_us": 596571330, "time_of_transmission_us": 596574144,
               "outputs": [1, 0], "name": "not defined" }
 }
 ```
 
-- `range_m[i]` belongs to angle `start + i * step`.
-- `invalid` counts the `null` points by reason, and `codes` lists
-  `[index, raw]` for every point with a status code other than 0, for example
-  `[[102, 2]]`. A dazzled scanner (`dazzled > 0`) is blind at those angles,
-  which is not the same as seeing nothing. The angle is in the
-  device convention: for a TiM55x, -45…225° with 90° straight ahead
+- `range_m[i]` belongs to angle `start + i * step`, in metres. The angle is in
+  the device convention: for a TiM55x, -45…225° with 90° straight ahead
   (inferred from the symmetric range, check against your mounting).
-  `null` means there is no valid distance. That is not the same as free space.
+- `null` means there is no valid distance. That is not the same as free space.
+- `invalid` counts the `null` points by reason, and `codes` lists
+  `[index, raw]` for every point with a status code other than 0. A dazzled
+  scanner (`dazzled > 0`) is blind at those angles.
 - `counter_gap` counts scans the device numbered but we never received.
 - `rssi` (raw) is included when the scanner sends an `RSSI` channel.
 - `scan_utc_us_est` maps the telegram's "time since startup" field to UTC.
@@ -140,7 +155,7 @@ reserved values"), valid distances start at raw value 16:
 | 0 | invalid: very low remission, out of range (too close or too far), or removed by a filter | `no_echo` |
 | 1 | invalid: the device was dazzled, e.g. by sunlight | `dazzled` |
 | 2 | implausible measurement | `implausible` |
-| 3–15 | reserved | `reserved` |
+| 3–15 | reserved (the manual lists 4–15 and does not mention 3) | `reserved` |
 | ≥ 16 | valid distance (max. 10,000 mm; beyond that the device sends 0) | |
 
 On a real TiM551, raw `2` appeared at one angle that looked across a depth
@@ -151,10 +166,10 @@ binary format always keep the unmodified raw values.
 ### `status` (JSON, on every change and once per second)
 
 `state` is one of `connecting`, `streaming`, `disconnected`, `replay_ended` or
-`stopped`. `last_scan_age_ms` is measured with a monotonic clock. The message also has `detail`, `state_since_utc_us`, `now_utc_us`,
-`last_scan_utc_us`, `last_scan_age_ms`, the counters `scans`, `counter_gaps`
-and `bad_telegrams`, the device `identity` (`DeviceIdent`, `DItype`, `DIornr`,
-`SCdevicestate` replies), and `host_clock`.
+`stopped`. The message also has `detail`, `state_since_utc_us`, `now_utc_us`,
+`last_scan_utc_us`, `last_scan_age_ms` (measured with a monotonic clock), the
+counters `scans`, `counter_gaps` and `bad_telegrams`, the device `identity`
+(`DeviceIdent`, `DItype`, `DIornr`, `SCdevicestate` replies), and `host_clock`.
 
 `host_clock` holds `{synced, est_error_us, max_error_us}` as reported by
 the kernel. How meaningful the error fields are depends on the NTP daemon.
@@ -196,8 +211,9 @@ repositories (`*.jsonl` is in `.gitignore`).
 
 ## Network notes
 
-Factory setting is `192.168.0.1/24`, but devices may be set to DHCP. This one
-was, and it sent DHCP requests (`udhcp 1.16.1`) until it got a lease. On a
+Factory setting is `192.168.0.1/24`, but devices may be set to DHCP. The unit
+tested here was, and it sent DHCP requests (`udhcp 1.16.1`) until it got a
+lease. On a
 direct cable you then need a DHCP server on that port, or a static address
 configured with SOPAS. Also check that no local network (Docker bridges!)
 already uses the scanner's subnet.
@@ -218,8 +234,9 @@ Unit tests cover framing, the parser, clock mapping and frame encoding.
 - unsubscribe when cancelled before the subscription is acknowledged, and a
   prompt stop when cancelled during identification
 - a foreign Origin (rejected), the client limit, and an idle handshake that
-  is dropped at its deadline The fixtures are synthetic, built in the TiM551 telegram
-layout.
+  is dropped at its deadline
+
+The fixtures are synthetic, built in the TiM551 telegram layout.
 
 Against a real 5-second TiM551 recording (75 scans), replay decoded every
 scan with no errors and matched an independent Python decoder value for value.
@@ -235,21 +252,26 @@ cargo fuzz run cola_stream -- -max_len=4096
 
 ## Container image
 
-Build with `docker build -t tim-ws:local .`. The multi-stage image uses a locked
-Rust build and a Debian slim runtime as UID/GID 65532. It contains no recordings.
-Run with `--listen 0.0.0.0:9002` inside the container; publish a port only when
-needed, or keep it internal behind a reverse proxy that serves your dashboard
-under the same origin.
+```sh
+docker build -t tim-ws:local .
+docker run --rm -p 127.0.0.1:9002:9002 --read-only --cap-drop ALL \
+  tim-ws:local --sensor 192.168.0.1:2111 --listen 0.0.0.0:9002
+```
+
+The multi-stage image uses a locked Rust build and a Debian slim runtime as
+UID/GID 65532. It contains no recordings. Inside the container tim-ws must
+listen on `0.0.0.0`; publish the port only on the addresses you need, or keep
+it internal behind a reverse proxy that serves your dashboard under the same
+origin.
 
 The bundled `tim-ws-healthcheck [ws://127.0.0.1:9002/]` checks that bridge status is
 `streaming` with a monotonic scan age below 1500 ms. It connects only to the
-WebSocket, never to the scanner. Container health does not assert mouse detection.
-Use a read-only filesystem, dropped capabilities, bounded logs and a 10-second
+WebSocket, never to the scanner. Use a read-only filesystem, dropped capabilities, bounded logs and a 10-second
 stop grace period. SIGTERM retains the normal scanner unsubscribe path.
 
 ## License
 
-MIT or Apache-2.0, at your option.
+[MIT](LICENSE).
 
 SICK and TiM are trademarks of SICK AG. This project is not affiliated with
 or endorsed by SICK AG. It implements the publicly documented CoLa A

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1 – 2026-10-21
+
+- License is now MIT only (0.1.0 was MIT or Apache-2.0).
+- README: install and Docker instructions, corrected sections.
+
 ## 0.1.0 – 2026-10-21
 
 First version.
