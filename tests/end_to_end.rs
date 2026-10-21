@@ -99,7 +99,7 @@ async fn streams_fragmented_scans_and_reconnects() {
     let cancel = CancellationToken::new();
     let (events, events_rx) = mpsc::channel(64);
     let channels = Hub::new("mock".into(), 1).spawn(events_rx);
-    tokio::spawn(server::serve(ws_listener, channels, cancel.clone()));
+    tokio::spawn(server::serve(ws_listener, channels, server::ServerConfig::default(), cancel.clone()));
 
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{ws_addr}/")).await.unwrap();
     assert_eq!(next_json(&mut ws).await["type"], "status");
@@ -149,7 +149,7 @@ async fn streams_fragmented_scans_and_reconnects() {
     assert!(silent["detail"].as_str().unwrap().contains("no telegram"), "{silent}");
 
     cancel.cancel();
-    timeout(Duration::from_secs(2), sensor_task).await.unwrap().unwrap();
+    timeout(Duration::from_secs(2), sensor_task).await.unwrap().unwrap().unwrap();
     mock.abort();
 }
 
@@ -163,7 +163,7 @@ async fn binary_clients_get_binary_scans() {
     let cancel = CancellationToken::new();
     let (events, events_rx) = mpsc::channel(64);
     let channels = Hub::new("mock".into(), 1).spawn(events_rx);
-    tokio::spawn(server::serve(ws_listener, channels, cancel.clone()));
+    tokio::spawn(server::serve(ws_listener, channels, server::ServerConfig::default(), cancel.clone()));
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{ws_addr}/?format=binary")).await.unwrap();
 
     let cfg = sensor::SensorConfig {
@@ -184,5 +184,95 @@ async fn binary_clients_get_binary_scans() {
     assert_eq!(&bin[..4], b"TIM1");
     assert_eq!(bin.len(), 52 + 6);
     assert_eq!(u16::from_le_bytes([bin[54], bin[55]]), 0xB0);
+    cancel.cancel();
+}
+
+fn sensor_cfg(addr: String) -> sensor::SensorConfig {
+    sensor::SensorConfig { addr, connect_timeout: Duration::from_secs(1), watchdog: Duration::from_millis(500) }
+}
+
+/// Cancel while the scanner ignores the subscription request: the bridge must
+/// still try to unsubscribe and stop promptly.
+#[tokio::test]
+async fn cancel_before_subscription_ack_still_unsubscribes() {
+    let scanner = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = scanner.local_addr().unwrap().to_string();
+    let cancel = CancellationToken::new();
+    let (events, mut events_rx) = mpsc::channel(64);
+    tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
+    let task = tokio::spawn(sensor::run(sensor_cfg(addr), events, None, cancel.clone()));
+
+    let (mut sock, _) = scanner.accept().await.unwrap();
+    loop {
+        let cmd = read_command(&mut sock).await;
+        if cmd == "sEN LMDscandata 1" {
+            break; // never acknowledged
+        }
+        let name = cmd.strip_prefix("sRN ").unwrap();
+        sock.write_all(format!("\x02sRA {name} 1\x03").as_bytes()).await.unwrap();
+    }
+    cancel.cancel();
+    let next = timeout(Duration::from_secs(1), read_command(&mut sock)).await.expect("no unsubscribe sent");
+    assert_eq!(next, "sEN LMDscandata 0");
+    timeout(Duration::from_secs(1), task).await.expect("task did not stop").unwrap().unwrap();
+}
+
+/// Cancel during identification stops at once instead of finishing the queries.
+#[tokio::test]
+async fn cancel_during_identification_stops_promptly() {
+    let scanner = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = scanner.local_addr().unwrap().to_string();
+    let cancel = CancellationToken::new();
+    let (events, mut events_rx) = mpsc::channel(64);
+    tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
+    let task = tokio::spawn(sensor::run(sensor_cfg(addr), events, None, cancel.clone()));
+    let (mut sock, _) = scanner.accept().await.unwrap();
+    assert_eq!(read_command(&mut sock).await, "sRN DeviceIdent");
+    cancel.cancel();
+    timeout(Duration::from_millis(300), task).await.expect("task did not stop").unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn foreign_origin_is_rejected_and_client_limit_holds() {
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_addr = ws_listener.local_addr().unwrap();
+    let cancel = CancellationToken::new();
+    let (_events, events_rx) = mpsc::channel(8);
+    let channels = Hub::new("mock".into(), 16).spawn(events_rx);
+    let cfg = server::ServerConfig { max_clients: 1, ..Default::default() };
+    tokio::spawn(server::serve(ws_listener, channels, cfg, cancel.clone()));
+
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = format!("ws://{ws_addr}/").into_client_request().unwrap();
+    req.headers_mut().insert("origin", "https://untrusted.example".parse().unwrap());
+    let err = tokio_tungstenite::connect_async(req).await.expect_err("foreign origin accepted");
+    assert!(err.to_string().contains("403"), "{err}");
+
+    let mut req = format!("ws://{ws_addr}/").into_client_request().unwrap();
+    req.headers_mut().insert("origin", "http://localhost:8765".parse().unwrap());
+    let (mut first, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    assert_eq!(next_json(&mut first).await["type"], "status");
+    // The only slot is taken: a second client is turned away.
+    assert!(tokio_tungstenite::connect_async(format!("ws://{ws_addr}/")).await.is_err());
+    cancel.cancel();
+}
+
+/// Silent TCP peers occupy a slot only until the handshake deadline.
+#[tokio::test]
+async fn idle_handshake_is_dropped() {
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_addr = ws_listener.local_addr().unwrap();
+    let cancel = CancellationToken::new();
+    let (_events, events_rx) = mpsc::channel(8);
+    let channels = Hub::new("mock".into(), 16).spawn(events_rx);
+    let cfg =
+        server::ServerConfig { max_clients: 1, handshake_timeout: Duration::from_millis(200), ..Default::default() };
+    tokio::spawn(server::serve(ws_listener, channels, cfg, cancel.clone()));
+    let mut idle = TcpStream::connect(ws_addr).await.unwrap();
+    let mut buf = [0u8; 1];
+    let n = timeout(Duration::from_secs(2), idle.read(&mut buf)).await.expect("idle peer kept").unwrap_or(0);
+    assert_eq!(n, 0, "server should close the idle connection");
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{ws_addr}/")).await.unwrap();
+    assert_eq!(next_json(&mut ws).await["type"], "status");
     cancel.cancel();
 }

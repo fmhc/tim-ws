@@ -33,19 +33,19 @@ const IDENTIFY: &[&str] = &["DeviceIdent", "DItype", "DIornr", "SCdevicestate"];
 const BACKOFF_MIN: Duration = Duration::from_millis(250);
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
 
+/// Runs until `cancel` fires (Ok) or the hub goes away (Err).
 pub async fn run(
     cfg: SensorConfig,
     events: mpsc::Sender<Event>,
     recorder: Option<Recorder>,
     cancel: CancellationToken,
-) {
+) -> Result<(), String> {
     let mut pipeline = Pipeline::new(false);
     let mut backoff = BACKOFF_MIN;
+    let state = |state, detail: String| Event::State { state, detail };
+    let hub_gone = |_| "hub stopped".to_string();
     loop {
-        let state = |state, detail: String| Event::State { state, detail };
-        if events.send(state(State::Connecting, cfg.addr.clone())).await.is_err() {
-            return;
-        }
+        events.send(state(State::Connecting, cfg.addr.clone())).await.map_err(hub_gone)?;
         pipeline.reset();
         let mut session = Session { cfg: &cfg, events: &events, recorder: recorder.as_ref(), scans: 0 };
         let result = session.run(&mut pipeline, &cancel).await;
@@ -53,26 +53,20 @@ pub async fn run(
             backoff = BACKOFF_MIN;
         }
         match result {
-            Ok(()) => {
-                let _ = events.send(state(State::Stopped, "shutdown".into())).await;
-                return;
-            }
+            Ok(()) => break,
             Err(reason) => {
                 tracing::warn!("sensor {}: {reason}; retrying in {backoff:?}", cfg.addr);
-                if events.send(state(State::Disconnected, reason)).await.is_err() {
-                    return;
-                }
+                events.send(state(State::Disconnected, reason)).await.map_err(hub_gone)?;
             }
         }
         tokio::select! {
             _ = sleep(backoff) => {}
-            _ = cancel.cancelled() => {
-                let _ = events.send(state(State::Stopped, "shutdown".into())).await;
-                return;
-            }
+            _ = cancel.cancelled() => break,
         }
         backoff = (backoff * 2).min(BACKOFF_MAX);
     }
+    let _ = events.send(state(State::Stopped, "shutdown".into())).await;
+    Ok(())
 }
 
 struct Session<'a> {
@@ -84,52 +78,67 @@ struct Session<'a> {
 
 type Io = Framed<TcpStream, ColaA>;
 
+/// Budget for unsubscribing on the way out.
+const UNSUBSCRIBE_TIMEOUT: Duration = Duration::from_millis(500);
+
 impl Session<'_> {
-    /// Ok(()) means a clean shutdown; Err carries the reason to reconnect.
+    /// Ok(()) means cancelled; Err carries the reason to reconnect.
+    /// Cancellation is honoured in every phase. Once the subscription was
+    /// requested, the scanner is always asked to unsubscribe before returning.
     async fn run(&mut self, pipeline: &mut Pipeline, cancel: &CancellationToken) -> Result<(), String> {
-        let stream = timeout(self.cfg.connect_timeout, TcpStream::connect(&self.cfg.addr))
-            .await
-            .map_err(|_| "connect timed out".to_string())?
-            .map_err(|e| format!("connect failed: {e}"))?;
+        let connect = timeout(self.cfg.connect_timeout, TcpStream::connect(&self.cfg.addr));
+        let stream = tokio::select! {
+            r = connect => r
+                .map_err(|_| "connect timed out".to_string())?
+                .map_err(|e| format!("connect failed: {e}"))?,
+            _ = cancel.cancelled() => return Ok(()),
+        };
         stream.set_nodelay(true).map_err(|e| e.to_string())?;
         let mut io = Framed::new(stream, ColaA::default());
 
+        let mut subscribed = false;
+        let result = tokio::select! {
+            r = self.stream(&mut io, pipeline, &mut subscribed) => r,
+            _ = cancel.cancelled() => Ok(()),
+        };
+        if subscribed {
+            // Leave the scanner unsubscribed for the next client.
+            let stop = self.request(&mut io, "sEN LMDscandata 0", "sEA LMDscandata 0");
+            match timeout(UNSUBSCRIBE_TIMEOUT, stop).await {
+                Ok(Ok(Some(_))) => tracing::info!("scan subscription stopped"),
+                _ if result.is_err() => tracing::debug!("unsubscribe after failure not confirmed"),
+                _ => tracing::warn!("scanner did not confirm unsubscribing"),
+            }
+        }
+        result
+    }
+
+    /// Identify, subscribe and stream; only returns on failure.
+    async fn stream(&mut self, io: &mut Io, pipeline: &mut Pipeline, subscribed: &mut bool) -> Result<(), String> {
         let mut identity = Vec::new();
         for name in IDENTIFY {
-            if let Some(answer) = self.request(&mut io, &format!("sRN {name}"), &format!("sRA {name} ")).await? {
+            if let Some(answer) = self.request(io, &format!("sRN {name}"), &format!("sRA {name} ")).await? {
                 identity.push((name.to_string(), answer));
             }
         }
         self.send_event(Event::Identity(identity)).await?;
 
-        if self.request(&mut io, "sEN LMDscandata 1", "sEA LMDscandata 1").await?.is_none() {
+        *subscribed = true;
+        if self.request(io, "sEN LMDscandata 1", "sEA LMDscandata 1").await?.is_none() {
             return Err("scanner did not confirm the scan subscription".into());
         }
         self.send_event(Event::State { state: State::Streaming, detail: self.cfg.addr.clone() }).await?;
 
         loop {
-            tokio::select! {
-                next = timeout(self.cfg.watchdog, io.next()) => {
-                    let payload = match next {
-                        Err(_) => return Err(format!("no telegram for {} ms", self.cfg.watchdog.as_millis())),
-                        Ok(None) => return Err("connection closed by scanner".into()),
-                        Ok(Some(Err(e))) => return Err(format!("read failed: {e}")),
-                        Ok(Some(Ok(p))) => p,
-                    };
-                    let t = now_utc_us();
-                    self.record(Dir::Rx, t, &payload);
-                    self.handle(pipeline, payload, t).await?;
-                }
-                _ = cancel.cancelled() => {
-                    // Leave the scanner unsubscribed for the next client.
-                    let stop = self.request(&mut io, "sEN LMDscandata 0", "sEA LMDscandata 0");
-                    match timeout(Duration::from_millis(500), stop).await {
-                        Ok(Ok(Some(_))) => tracing::info!("scan subscription stopped"),
-                        _ => tracing::warn!("scanner did not confirm unsubscribing"),
-                    }
-                    return Ok(());
-                }
-            }
+            let payload = match timeout(self.cfg.watchdog, io.next()).await {
+                Err(_) => return Err(format!("no telegram for {} ms", self.cfg.watchdog.as_millis())),
+                Ok(None) => return Err("connection closed by scanner".into()),
+                Ok(Some(Err(e))) => return Err(format!("read failed: {e}")),
+                Ok(Some(Ok(p))) => p,
+            };
+            let t = now_utc_us();
+            self.record(Dir::Rx, t, &payload);
+            self.handle(pipeline, payload, t).await?;
         }
     }
 

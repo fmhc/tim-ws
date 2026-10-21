@@ -14,6 +14,7 @@ fuzz_target!(|data: &[u8]| {
         buf.extend_from_slice(piece);
         while let Ok(Some(frame)) = codec.decode(&mut buf) {
             assert!(!frame.contains(&tim_ws::cola::STX) && !frame.contains(&tim_ws::cola::ETX));
+            assert!(frame.len() <= 512);
         }
     }
 });

@@ -5,7 +5,9 @@
 //! time. `receive - transmit` is the clock offset plus network and stack
 //! latency, so the minimum over a sliding window is the best offset estimate.
 //! The estimate is therefore late by the minimum latency (sub-millisecond on
-//! a direct link) and accurate only to the host clock's own NTP error.
+//! a direct link), carries the host clock's own NTP error, and drifts with
+//! the rate difference of the two clocks across the window (about 1.7 ms at
+//! 100 ppm over 256 scans, either sign). Rates are not estimated.
 
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};

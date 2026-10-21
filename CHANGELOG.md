@@ -11,4 +11,9 @@ First version.
 - Device clock mapped to UTC.
 - Raw JSONL recording with a size limit; replay paced by the device clock.
 - Browser viewer (`examples/viewer.html`), fuzz targets, end-to-end tests.
-- Verified live against a TiM551-2050001 (firmware V2.54).
+- Raw distance values below 16 are reported as SICK status codes (no echo,
+  dazzled, implausible, reserved) instead of distances.
+- Server limits: client cap, handshake deadline, small message limits,
+  Origin check for browser clients.
+- Verified live against a TiM551-2050001 (firmware V2.54), direct and via a
+  router over Wi-Fi.

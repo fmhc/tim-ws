@@ -49,16 +49,45 @@ By default it listens on `127.0.0.1:9002`. Use `--listen 0.0.0.0:9002` to serve
 the network. Connect to `ws://host:9002/` for JSON, or `ws://host:9002/?format=binary`
 for binary scans. Status messages are always JSON text.
 
-Other options: `--sensor-id` (name in all messages), `--invalid-below` (raw
-distances below this value become `null`, default `1`, so only `0` means
-"no echo"), `--watchdog-ms` (default 1000), `--record-max-mib` (default 256),
-`-v`. On shutdown (Ctrl-C/SIGTERM) the scanner is unsubscribed.
+Other options:
+
+- `--sensor-id`: name for the scanner in all messages.
+- `--invalid-below`: raw distances below this become `null`. The default and
+  minimum is `16`, because smaller values are status codes (see below).
+  Raise it to `50` to also drop readings under the TiM551's 0.05 m working range.
+- `--max-clients`: simultaneous clients, pending handshakes included (default 32).
+- `--allow-origin`: an extra browser Origin that may connect (repeatable, see below).
+- `--watchdog-ms` (default 1000), `--record-max-mib` (default 256), `-v`.
+
+On shutdown (Ctrl-C/SIGTERM) the scanner is unsubscribed, in every connection
+phase. If the data source fails (for example an unreadable replay file), the
+process exits with an error instead of serving stale status.
+
+### Browser access
+
+Browsers do not apply CORS to WebSockets, so without a check any web page
+could read the scans of your room. tim-ws always accepts clients without an
+`Origin` header (scripts, services) and browser pages served from `localhost`,
+`127.0.0.1` or `[::1]`. Any other page needs `--allow-origin`, for example
+`--allow-origin http://192.168.178.41:8000`. A file opened directly from disk
+sends `Origin: null`, which is rejected unless you pass `--allow-origin null`.
+None of this is authentication: when you listen on the network, any non-browser
+client on that network can connect.
 
 ## Viewer
 
 `examples/viewer.html` is a dependency-free browser view: a polar plot with
-range rings, rate, data age, gaps and NTP state. Open it with
-`?ws=ws://host:9002/` (default `ws://127.0.0.1:9002/`). The mouse wheel zooms.
+range rings, rate, data age, gaps, status codes and NTP state. Serve it on
+localhost and point it at the bridge:
+
+```sh
+cd examples && python3 -m http.server 8765 --bind 127.0.0.1
+# open http://127.0.0.1:8765/viewer.html?ws=ws://127.0.0.1:9002/
+```
+
+The mouse wheel zooms. Data age is measured with the browser's monotonic
+clock from when the scan arrived, so clock skew between machines cannot make
+old data look fresh.
 
 ## Messages
 
@@ -78,21 +107,51 @@ range rings, rate, data age, gaps and NTP state. Open it with
 }
 ```
 
-- `range_m[i]` belongs to angle `start + i * step`. The angle is in the
+- `range_m[i]` belongs to angle `start + i * step`.
+- `invalid` counts the `null` points by reason, and `codes` lists
+  `[index, raw]` for every point with a status code other than 0, for example
+  `[[102, 2]]`. A dazzled scanner (`dazzled > 0`) is blind at those angles,
+  which is not the same as seeing nothing. The angle is in the
   device convention: for a TiM55x, -45…225° with 90° straight ahead
   (inferred from the symmetric range, check against your mounting).
-  `null` means there is no valid echo. That is not the same as free space.
+  `null` means there is no valid distance. That is not the same as free space.
 - `counter_gap` counts scans the device numbered but we never received.
 - `rssi` (raw) is included when the scanner sends an `RSSI` channel.
 - `scan_utc_us_est` maps the telegram's "time since startup" field to UTC.
-  The offset is the minimum of `receive − transmit` over the last 256 scans.
-  It is therefore late by the minimum network latency, and only as good as
-  the host clock. `host_recv_utc_us` is the plain receive time.
+  The offset is the minimum of `receive − transmit` over the last 256 scans
+  (about 17 s). This removes network jitter: live over Wi-Fi, receive times
+  jittered by 6 ms while the estimate stayed within 0.04 ms. The error has
+  three parts:
+  - the minimum network latency (the estimate is late by it),
+  - the host clock's own NTP error,
+  - drift between the scanner and host clocks across the window: about
+    1.7 ms at 100 ppm, with either sign.
+
+  A step of the host clock shifts the estimate once it enters the window.
+  `host_recv_utc_us` is the plain receive time.
+
+### Raw status codes
+
+From the TiM55x/56x/57x/58x operating instructions (annex, "LMDscandata –
+reserved values"), valid distances start at raw value 16:
+
+| Raw | Meaning | JSON reason |
+| --- | --- | --- |
+| 0 | invalid: very low remission, out of range (too close or too far), or removed by a filter | `no_echo` |
+| 1 | invalid: the device was dazzled, e.g. by sunlight | `dazzled` |
+| 2 | implausible measurement | `implausible` |
+| 3–15 | reserved | `reserved` |
+| ≥ 16 | valid distance (max. 10,000 mm; beyond that the device sends 0) | |
+
+On a real TiM551, raw `2` appeared at one angle that looked across a depth
+edge: the neighbouring readings were 2.5 m, then 3.0 m, then 2.6 m. Two
+objects at different distances shared the light spot. Recordings and the
+binary format always keep the unmodified raw values.
 
 ### `status` (JSON, on every change and once per second)
 
 `state` is one of `connecting`, `streaming`, `disconnected`, `replay_ended` or
-`stopped`. The message also has `detail`, `state_since_utc_us`, `now_utc_us`,
+`stopped`. `last_scan_age_ms` is measured with a monotonic clock. The message also has `detail`, `state_since_utc_us`, `now_utc_us`,
 `last_scan_utc_us`, `last_scan_age_ms`, the counters `scans`, `counter_gaps`
 and `bad_telegrams`, the device `identity` (`DeviceIdent`, `DItype`, `DIornr`,
 `SCdevicestate` replies), and `host_clock`.
@@ -116,7 +175,7 @@ the kernel. How meaningful the error fields are depends on the NTP daemon.
 | 20 | `u64` | `seq` |
 | 28 | `u16` | device scan counter |
 | 30 | `u16` | `counter_gap` (saturated) |
-| 32 | `u16` | `invalid_below` |
+| 32 | `u16` | `invalid_below` (≥ 16; raw values below it are not distances) |
 | 34 | `u16` | point count `n` |
 | 36 | `f32` | start angle, degrees |
 | 40 | `f32` | step, degrees |
@@ -150,10 +209,16 @@ cargo test
 ```
 
 Unit tests cover framing, the parser, clock mapping and frame encoding.
-`tests/end_to_end.rs` runs a mock scanner over real sockets: identification,
-subscription, scans fragmented into 37-byte writes, a missing scan counter, a
-dropped connection with reconnect, a silent link that trips the watchdog, and
-a binary client. The fixtures are synthetic, built in the TiM551 telegram
+`tests/end_to_end.rs` runs a mock scanner over real sockets:
+
+- identification and subscription, with scans fragmented into 37-byte writes
+- a missing scan counter
+- a dropped connection with reconnect, and a silent link that trips the watchdog
+- a binary client
+- unsubscribe when cancelled before the subscription is acknowledged, and a
+  prompt stop when cancelled during identification
+- a foreign Origin (rejected), the client limit, and an idle handshake that
+  is dropped at its deadline The fixtures are synthetic, built in the TiM551 telegram
 layout.
 
 Against a real 5-second TiM551 recording (75 scans), replay decoded every

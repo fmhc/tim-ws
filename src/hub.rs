@@ -3,7 +3,7 @@
 //! the sensor connection.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde::Serialize;
@@ -64,6 +64,8 @@ pub struct Hub {
     bad_telegrams: u64,
     counter_gaps: u64,
     last_scan_utc_us: Option<i64>,
+    /// Monotonic receive time of the last scan; ages never depend on the wall clock.
+    last_scan_at: Option<Instant>,
     clock: Option<ClockStatus>,
 }
 
@@ -80,6 +82,7 @@ impl Hub {
             bad_telegrams: 0,
             counter_gaps: 0,
             last_scan_utc_us: None,
+            last_scan_at: None,
             clock: host_clock(),
         }
     }
@@ -96,7 +99,7 @@ impl Hub {
                 "state_since_utc_us": self.state_since_utc_us,
                 "now_utc_us": now,
                 "last_scan_utc_us": self.last_scan_utc_us,
-                "last_scan_age_ms": self.last_scan_utc_us.map(|t| (now - t) / 1000),
+                "last_scan_age_ms": self.last_scan_at.map(|t| t.elapsed().as_millis() as u64),
                 "scans": self.scans,
                 "counter_gaps": self.counter_gaps,
                 "bad_telegrams": self.bad_telegrams,
@@ -119,7 +122,17 @@ impl Hub {
                 tokio::select! {
                     ev = events.recv() => match ev {
                         Some(ev) => self.apply(ev, &tx, &status_tx),
-                        None => break,
+                        None => {
+                            // Every source is gone: never leave a stale "streaming" behind.
+                            if self.state != State::Stopped {
+                                self.apply(
+                                    Event::State { state: State::Stopped, detail: "data source ended".into() },
+                                    &tx,
+                                    &status_tx,
+                                );
+                            }
+                            break;
+                        }
                     },
                     _ = tick.tick() => {
                         self.clock = host_clock();
@@ -141,6 +154,7 @@ impl Hub {
                         self.scans += 1;
                         self.counter_gaps += u64::from(frame.counter_gap);
                         self.last_scan_utc_us = Some(frame.host_recv_utc_us);
+                        self.last_scan_at = Some(Instant::now());
                         let _ = tx.send(Arc::new(Outgoing { text: text.into(), binary: Some(bin) }));
                     }
                     _ => self.bad_telegrams += 1,

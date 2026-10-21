@@ -55,6 +55,13 @@ impl Decoder for ColaA {
             match src[from..].iter().position(|&b| b == ETX || b == STX) {
                 Some(rel) if src[from + rel] == ETX => {
                     let end = from + rel;
+                    if end - 1 > self.max_frame {
+                        // Complete but too long: drop it whole, keep what follows.
+                        src.advance(end + 1);
+                        self.scanned = 0;
+                        self.discarded_frames += 1;
+                        continue;
+                    }
                     let mut frame = src.split_to(end + 1);
                     frame.advance(1);
                     frame.truncate(end - 1);
@@ -133,6 +140,16 @@ mod tests {
         let mut codec = ColaA::new(8);
         let frames = decode_all(&mut codec, &[b"\x02123456789012", b"345\x03\x02ok\x03"]);
         assert_eq!(frames, vec![&b"ok"[..]]);
+        assert_eq!(codec.discarded_frames, 1);
+    }
+
+    #[test]
+    fn oversized_complete_frame_is_dropped() {
+        let mut codec = ColaA::new(8);
+        assert_eq!(decode_all(&mut codec, &[b"\x02123456789\x03\x0212345678\x03"]), vec![&b"12345678"[..]]);
+        assert_eq!(codec.discarded_frames, 1);
+        let mut codec = ColaA::new(8);
+        assert_eq!(decode_all(&mut codec, &[b"\x0212345678", b"9\x03\x02ok\x03"]), vec![&b"ok"[..]]);
         assert_eq!(codec.discarded_frames, 1);
     }
 

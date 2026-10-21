@@ -30,17 +30,20 @@ pub struct ReplayConfig {
 /// Device clock gaps above this are not slept (recording pauses, restarts).
 const MAX_PAUSE_US: u32 = 2_000_000;
 
-pub async fn run(cfg: ReplayConfig, events: mpsc::Sender<Event>, cancel: CancellationToken) {
+/// Runs until `cancel` fires (Ok) or the file cannot be replayed (Err).
+/// After a single pass it keeps serving the `replay_ended` status.
+pub async fn run(cfg: ReplayConfig, events: mpsc::Sender<Event>, cancel: CancellationToken) -> Result<(), String> {
     let mut pipeline = Pipeline::new(true);
     let detail = format!("replay {}", cfg.path.display());
     loop {
         if events.send(Event::State { state: State::Streaming, detail: detail.clone() }).await.is_err() {
-            return;
+            return Err("hub stopped".into());
         }
         let end = tokio::select! {
             r = replay_file(&cfg, &mut pipeline, &events) => r,
             _ = cancel.cancelled() => Ok(()),
         };
+        let failed = end.is_err();
         let (state, detail) = match end {
             Err(e) => (State::Stopped, format!("replay failed: {e}")),
             Ok(()) if cancel.is_cancelled() => (State::Stopped, "shutdown".to_string()),
@@ -48,12 +51,15 @@ pub async fn run(cfg: ReplayConfig, events: mpsc::Sender<Event>, cancel: Cancell
             Ok(()) => (State::ReplayEnded, detail.clone()),
         };
         tracing::info!("{detail}");
-        let _ = events.send(Event::State { state, detail }).await;
+        let _ = events.send(Event::State { state, detail: detail.clone() }).await;
+        if failed {
+            return Err(detail);
+        }
         if state == State::ReplayEnded {
             // Keep serving the final status until shutdown.
             cancel.cancelled().await;
         }
-        return;
+        return Ok(());
     }
 }
 
@@ -77,10 +83,9 @@ async fn replay_file(cfg: &ReplayConfig, pipeline: &mut Pipeline, events: &mpsc:
         };
         if let Some(prev) = last_device_us {
             let gap = scan.time_since_startup_us.wrapping_sub(prev);
-            if cfg.speed > 0.0 && gap <= MAX_PAUSE_US {
-                sleep(Duration::from_secs_f64(f64::from(gap) / 1e6 / cfg.speed)).await;
-            } else if cfg.speed <= 0.0 {
-                tokio::task::yield_now().await;
+            match pause(gap, cfg.speed) {
+                Some(d) => sleep(d).await,
+                None => tokio::task::yield_now().await,
             }
         }
         last_device_us = Some(scan.time_since_startup_us);
@@ -89,6 +94,15 @@ async fn replay_file(cfg: &ReplayConfig, pipeline: &mut Pipeline, events: &mpsc:
         }
     }
     Ok(())
+}
+
+/// Sleep for a device clock gap at `speed`; None means do not wait.
+/// Non-finite or out-of-range speeds never panic, they just do not pace.
+fn pause(gap_us: u32, speed: f64) -> Option<Duration> {
+    if gap_us > MAX_PAUSE_US || !(speed.is_finite() && speed > 0.0) {
+        return None;
+    }
+    Duration::try_from_secs_f64(f64::from(gap_us) / 1e6 / speed).ok().filter(|d| d.as_secs() <= 60)
 }
 
 /// Received payload of one JSON line, without STX/ETX; None for tx or metadata.
@@ -120,6 +134,16 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pause_never_panics() {
+        assert_eq!(pause(66_667, 1.0), Some(Duration::from_micros(66_667)));
+        assert_eq!(pause(66_667, 0.0), None);
+        assert_eq!(pause(66_667, 1e-300), None);
+        assert_eq!(pause(66_667, f64::NAN), None);
+        assert_eq!(pause(66_667, f64::INFINITY), None);
+        assert_eq!(pause(3_000_000, 1.0), None);
+    }
 
     #[test]
     fn reads_both_line_formats() {

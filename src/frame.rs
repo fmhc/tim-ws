@@ -7,6 +7,20 @@ use serde::Serialize;
 use crate::clock::DeviceClock;
 use crate::scan::Scan;
 
+/// Raw distance values below this are status codes, not distances
+/// (TiM55x/56x/57x/58x operating instructions, "LMDscandata - reserved values").
+pub const FIRST_VALID_RAW: u16 = 16;
+
+/// Meaning of a raw distance value below [`FIRST_VALID_RAW`].
+pub fn raw_code_name(raw: u16) -> &'static str {
+    match raw {
+        0 => "no_echo",
+        1 => "dazzled",
+        2 => "implausible",
+        _ => "reserved",
+    }
+}
+
 /// Window for the offset minimum: 256 scans ≈ 17 s at 15 Hz.
 const CLOCK_WINDOW: usize = 256;
 
@@ -103,11 +117,25 @@ struct ScanJson<'a> {
     device_clock_restarted: bool,
     scan_hz: f64,
     angle: Angle,
-    /// Metres; `null` where the raw value is below `invalid_below` (no echo).
+    /// Metres; `null` where the raw value is a status code or below `invalid_below`.
     range_m: Vec<Option<f32>>,
+    /// Count of `null` points by reason.
+    invalid: Invalid,
+    /// `[index, raw]` for points with a status code other than 0 (dazzled, implausible, reserved).
+    codes: Vec<[u16; 2]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rssi: Option<&'a [u16]>,
     device: Device<'a>,
+}
+
+#[derive(Serialize, Default)]
+struct Invalid {
+    no_echo: u32,
+    dazzled: u32,
+    implausible: u32,
+    reserved: u32,
+    /// Valid per protocol, but below the configured `invalid_below`.
+    below_threshold: u32,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -118,10 +146,29 @@ impl ScanFrame {
         let s = &self.scan;
         let dist = s.channel("DIST").ok_or(NoDistanceChannel)?;
         let (scale, offset) = (dist.scale, dist.offset);
+        let threshold = invalid_below.max(FIRST_VALID_RAW);
+        let mut invalid = Invalid::default();
+        let mut codes = Vec::new();
         let range_m = dist
             .values
             .iter()
-            .map(|&v| (v >= invalid_below).then(|| (f32::from(v) * scale + offset) / 1000.0))
+            .enumerate()
+            .map(|(i, &v)| {
+                if v >= threshold {
+                    return Some((f32::from(v) * scale + offset) / 1000.0);
+                }
+                match v {
+                    0 => invalid.no_echo += 1,
+                    1 => invalid.dazzled += 1,
+                    2 => invalid.implausible += 1,
+                    3..FIRST_VALID_RAW => invalid.reserved += 1,
+                    _ => invalid.below_threshold += 1,
+                }
+                if (1..FIRST_VALID_RAW).contains(&v) {
+                    codes.push([i as u16, v]);
+                }
+                None
+            })
             .collect();
         let json = ScanJson {
             kind: "scan",
@@ -141,6 +188,8 @@ impl ScanFrame {
                 count: dist.values.len(),
             },
             range_m,
+            invalid,
+            codes,
             rssi: s.channel("RSSI").map(|c| c.values.as_slice()),
             device: Device {
                 serial: format!("{:X}", s.serial),
@@ -169,7 +218,7 @@ impl ScanFrame {
         b.put_u64_le(self.seq);
         b.put_u16_le(self.scan.scan_counter);
         b.put_u16_le(self.counter_gap.min(u32::from(u16::MAX)) as u16);
-        b.put_u16_le(invalid_below);
+        b.put_u16_le(invalid_below.max(FIRST_VALID_RAW));
         b.put_u16_le(dist.values.len() as u16);
         b.put_f32_le(dist.start_deg() as f32);
         b.put_f32_le(dist.step_deg() as f32);
@@ -188,7 +237,7 @@ mod tests {
     use crate::scan::{parse_scan, tests::synthetic};
 
     fn frame(p: &mut Pipeline, counter: u16, startup: u32, recv: i64) -> ScanFrame {
-        p.ingest(parse_scan(synthetic(counter, startup, &[0, 176, 0x717]).as_bytes()).unwrap(), recv)
+        p.ingest(parse_scan(synthetic(counter, startup, &[0, 176, 0x717, 1, 2, 3, 15, 16]).as_bytes()).unwrap(), recv)
     }
 
     #[test]
@@ -197,7 +246,15 @@ mod tests {
         let f = frame(&mut p, 7, 1_000_000, 1_700_000_000_000_000);
         let v: serde_json::Value = serde_json::from_str(&f.to_json("tim", 1).unwrap()).unwrap();
         assert_eq!(v["type"], "scan");
-        assert_eq!(v["range_m"], serde_json::json!([null, 0.176, 1.815]));
+        assert_eq!(v["range_m"], serde_json::json!([null, 0.176, 1.815, null, null, null, null, 0.016]));
+        assert_eq!(
+            v["invalid"],
+            serde_json::json!({"no_echo": 1, "dazzled": 1, "implausible": 1, "reserved": 2, "below_threshold": 0})
+        );
+        assert_eq!(v["codes"], serde_json::json!([[3, 1], [4, 2], [5, 3], [6, 15]]));
+        let raised: serde_json::Value = serde_json::from_str(&f.to_json("tim", 50).unwrap()).unwrap();
+        assert_eq!(raised["range_m"][7], serde_json::Value::Null);
+        assert_eq!(raised["invalid"]["below_threshold"], 1);
         assert_eq!(v["angle"]["start"], -45.0);
         assert_eq!(v["scan_utc_us_est"], 1_700_000_000_000_000i64 - 2814);
         assert_eq!(v["device"]["name"], "not defined");
@@ -217,9 +274,10 @@ mod tests {
         let mut p = Pipeline::new(false);
         let b = frame(&mut p, 7, 1_000_000, 42).to_binary(1).unwrap();
         assert_eq!(&b[..4], b"TIM1");
-        assert_eq!(b.len(), 52 + 6);
+        assert_eq!(b.len(), 52 + 16);
+        assert_eq!(u16::from_le_bytes(b[32..34].try_into().unwrap()), FIRST_VALID_RAW);
         assert_eq!(i64::from_le_bytes(b[4..12].try_into().unwrap()), 42);
-        assert_eq!(u16::from_le_bytes(b[34..36].try_into().unwrap()), 3);
+        assert_eq!(u16::from_le_bytes(b[34..36].try_into().unwrap()), 8);
         assert_eq!(f32::from_le_bytes(b[36..40].try_into().unwrap()), -45.0);
         assert_eq!(u16::from_le_bytes(b[54..56].try_into().unwrap()), 176);
     }

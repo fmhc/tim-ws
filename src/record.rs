@@ -31,13 +31,13 @@ pub struct Recorder {
 impl Recorder {
     /// Creates the file and spawns the writer task. The task flushes and ends
     /// once every `Recorder` clone is dropped; await the handle before exiting.
+    /// The handle yields a write or flush error; `max_bytes` covers the whole
+    /// file, metadata line included.
     pub async fn start(
         path: PathBuf,
         max_bytes: u64,
         sensor: String,
-    ) -> std::io::Result<(Self, tokio::task::JoinHandle<()>)> {
-        let file = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&path).await?;
-        let mut out = tokio::io::BufWriter::new(file);
+    ) -> std::io::Result<(Self, tokio::task::JoinHandle<std::io::Result<()>>)> {
         let meta = json!({
             "type": "meta",
             "tool": concat!("tim-ws ", env!("CARGO_PKG_VERSION")),
@@ -46,12 +46,18 @@ impl Recorder {
             "host_clock": host_clock(),
             "framing": "CoLa A, STX/ETX stripped",
         });
-        out.write_all(format!("{meta}\n").as_bytes()).await?;
+        let meta = format!("{meta}\n");
+        if meta.len() as u64 > max_bytes {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "recording limit is below one line"));
+        }
+        let file = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&path).await?;
+        let mut out = tokio::io::BufWriter::new(file);
+        out.write_all(meta.as_bytes()).await?;
         out.flush().await?;
 
         let (tx, mut rx) = mpsc::channel::<(i64, Dir, Bytes)>(1024);
         let writer = tokio::spawn(async move {
-            let mut written = 0u64;
+            let mut written = meta.len() as u64;
             while let Some((t, dir, payload)) = rx.recv().await {
                 let dir = match dir {
                     Dir::Rx => "rx",
@@ -72,15 +78,16 @@ impl Recorder {
                     );
                     break;
                 }
-                if let Err(e) = out.write_all(line.as_bytes()).await {
-                    tracing::error!("recording failed: {e}");
-                    break;
+                let mut res = out.write_all(line.as_bytes()).await;
+                if res.is_ok() && rx.is_empty() {
+                    res = out.flush().await;
                 }
-                if rx.is_empty() {
-                    let _ = out.flush().await;
+                if let Err(e) = res {
+                    tracing::error!("recording failed, recording stopped: {e}");
+                    return Err(e);
                 }
             }
-            let _ = out.flush().await;
+            out.flush().await.inspect_err(|e| tracing::error!("recording failed on final flush: {e}"))
         });
         Ok((Self { tx, dropped: Arc::new(AtomicU64::new(0)) }, writer))
     }
