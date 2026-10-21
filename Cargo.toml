@@ -2,6 +2,7 @@
 name = "tim-ws"
 version = "0.1.0"
 edition = "2021"
+default-run = "tim-ws"
 authors = ["Finn Malte Hinrichsen"]
 repository = "https://github.com/fmhc/tim-ws"
 description = "Streams SICK TiM LiDAR scans (CoLa A over TCP) to WebSocket clients, with UTC timestamps and clock status"

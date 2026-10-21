@@ -241,3 +241,16 @@ SICK and TiM are trademarks of SICK AG. This project is not affiliated with
 or endorsed by SICK AG. It implements the publicly documented CoLa A
 telegrams for reading scan data and only sends read and subscribe commands;
 it never changes scanner parameters.
+
+## Container image
+
+Build with `docker build -t tim-ws:local .`. The multi-stage image uses a locked
+Rust build and a Debian slim runtime as UID/GID 65532. It contains no recordings.
+Run with `--listen 0.0.0.0:9002` inside the container; publish a port only when
+needed. The Mausi stack keeps this port internal behind its dashboard proxy.
+
+The bundled `tim-ws-healthcheck [ws://127.0.0.1:9002/]` checks that bridge status is
+`streaming` with a monotonic scan age below 1500 ms. It connects only to the
+WebSocket, never to the scanner. Container health does not assert mouse detection.
+Use a read-only filesystem, dropped capabilities, bounded logs and a 10-second
+stop grace period. SIGTERM retains the normal scanner unsubscribe path.
