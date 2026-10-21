@@ -1,0 +1,18 @@
+# Example systemd unit. Adjust the scanner address, user and paths.
+[Unit]
+Description=SICK TiM LiDAR to WebSocket bridge
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/tim-ws --sensor 192.168.0.1:2111 --listen 127.0.0.1:9002
+Restart=on-failure
+RestartSec=2
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

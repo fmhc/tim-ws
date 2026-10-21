@@ -1,0 +1,30 @@
+[package]
+name = "tim-ws-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1"
+libfuzzer-sys = "0.4"
+tokio-util = { version = "0.7", features = ["codec"] }
+tim-ws = { path = ".." }
+
+[[bin]]
+name = "parse_scan"
+path = "fuzz_targets/parse_scan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cola_stream"
+path = "fuzz_targets/cola_stream.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
