@@ -39,7 +39,7 @@ scans/s to two clients at once, in 3.4 MB of resident memory.
 ## Install
 
 ```sh
-cargo install --git https://github.com/fmhc/tim-ws --tag v0.1.1
+cargo install --git https://github.com/fmhc/tim-ws --tag v0.1.1 tim-ws
 # or from a checkout
 cargo build --release
 ```
