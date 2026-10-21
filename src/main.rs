@@ -56,7 +56,7 @@ struct Args {
     #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u32).range(1..=4096))]
     max_clients: u32,
 
-    /// Browser Origin allowed to connect, e.g. http://192.168.178.41:8000 (repeatable).
+    /// Browser Origin allowed to connect, e.g. http://192.168.1.20:8000 (repeatable).
     /// Clients without an Origin header and http(s) origins on localhost are always allowed.
     #[arg(long = "allow-origin", value_name = "ORIGIN")]
     allow_origins: Vec<String>,

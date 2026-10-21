@@ -69,7 +69,7 @@ Browsers do not apply CORS to WebSockets, so without a check any web page
 could read the scans of your room. tim-ws always accepts clients without an
 `Origin` header (scripts, services) and browser pages served from `localhost`,
 `127.0.0.1` or `[::1]`. Any other page needs `--allow-origin`, for example
-`--allow-origin http://192.168.178.41:8000`. A file opened directly from disk
+`--allow-origin http://192.168.1.20:8000`. A file opened directly from disk
 sends `Origin: null`, which is rejected unless you pass `--allow-origin null`.
 None of this is authentication: when you listen on the network, any non-browser
 client on that network can connect.
@@ -233,6 +233,20 @@ cargo fuzz run cola_stream -- -max_len=4096
 
 `contrib/tim-ws.service` is an example systemd unit.
 
+## Container image
+
+Build with `docker build -t tim-ws:local .`. The multi-stage image uses a locked
+Rust build and a Debian slim runtime as UID/GID 65532. It contains no recordings.
+Run with `--listen 0.0.0.0:9002` inside the container; publish a port only when
+needed, or keep it internal behind a reverse proxy that serves your dashboard
+under the same origin.
+
+The bundled `tim-ws-healthcheck [ws://127.0.0.1:9002/]` checks that bridge status is
+`streaming` with a monotonic scan age below 1500 ms. It connects only to the
+WebSocket, never to the scanner. Container health does not assert mouse detection.
+Use a read-only filesystem, dropped capabilities, bounded logs and a 10-second
+stop grace period. SIGTERM retains the normal scanner unsubscribe path.
+
 ## License
 
 MIT or Apache-2.0, at your option.
@@ -241,16 +255,3 @@ SICK and TiM are trademarks of SICK AG. This project is not affiliated with
 or endorsed by SICK AG. It implements the publicly documented CoLa A
 telegrams for reading scan data and only sends read and subscribe commands;
 it never changes scanner parameters.
-
-## Container image
-
-Build with `docker build -t tim-ws:local .`. The multi-stage image uses a locked
-Rust build and a Debian slim runtime as UID/GID 65532. It contains no recordings.
-Run with `--listen 0.0.0.0:9002` inside the container; publish a port only when
-needed. The Mausi stack keeps this port internal behind its dashboard proxy.
-
-The bundled `tim-ws-healthcheck [ws://127.0.0.1:9002/]` checks that bridge status is
-`streaming` with a monotonic scan age below 1500 ms. It connects only to the
-WebSocket, never to the scanner. Container health does not assert mouse detection.
-Use a read-only filesystem, dropped capabilities, bounded logs and a 10-second
-stop grace period. SIGTERM retains the normal scanner unsubscribe path.
